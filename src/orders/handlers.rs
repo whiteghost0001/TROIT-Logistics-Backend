@@ -666,7 +666,13 @@ pub async fn update_order_status_handler(
 }
 
 /// POST /api/v1/orders/:id/pickup-inspection
-/// Records rider/agent pickup inspection for the order
+/// Records a pickup inspection for the order.
+///
+/// Security:
+/// - Only Admins or Field Agents assigned to the order may submit an inspection.
+/// - The order must be in an inspection-eligible state.
+/// - `inspection_status` is required (no default) and only an explicit PASSED
+///   transitions the order to READY_FOR_PICKUP.
 pub async fn create_pickup_inspection_handler(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -681,10 +687,57 @@ pub async fn create_pickup_inspection_handler(
     .await?
     .ok_or_else(|| AppError::NotFound("Order not found".to_string()))?;
 
-    let inspection_status = payload
-        .inspection_status
-        .unwrap_or_else(|| "PASSED".to_string())
-        .to_uppercase();
+    // Authorization: only Admin or an assigned Field Agent may submit an inspection.
+    // Buyers, Sellers, Riders and unrelated users are rejected.
+    match claims.role {
+        UserRole::Admin => {}
+        UserRole::FieldAgent => {
+            // Confirm the Field Agent is actually assigned to this order.
+            let assigned: Option<(Uuid,)> = sqlx::query_as(
+                r#"
+                SELECT order_id
+                FROM order_agent_assignments
+                WHERE order_id = $1 AND agent_id = $2 AND is_active = TRUE
+                LIMIT 1
+                "#,
+            )
+            .bind(order.id)
+            .bind(claims.sub)
+            .fetch_optional(&state.db)
+            .await?;
+
+            if assigned.is_none() {
+                return Err(AppError::Forbidden(
+                    "Field agent is not assigned to this order".to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(AppError::Forbidden(
+                "Only admins or assigned field agents can submit pickup inspections".to_string(),
+            ));
+        }
+    }
+
+    // Validate order is in an inspection-eligible state.
+    let inspection_eligible = matches!(
+        order.status.as_str(),
+        "CONFIRMED" | "READY_FOR_PICKUP"
+    );
+    if !inspection_eligible {
+        return Err(AppError::BadRequest(format!(
+            "Order in '{}' status is not eligible for pickup inspection",
+            order.status
+        )));
+    }
+
+    // inspection_status is required and must be explicit (no PASSED default).
+    let raw_status = payload.inspection_status.as_deref().ok_or_else(|| {
+        AppError::ValidationError(
+            "inspection_status is required and must be PASSED, FAILED, or PENDING".to_string(),
+        )
+    })?;
+    let inspection_status = raw_status.trim().to_uppercase();
     if inspection_status != "PASSED"
         && inspection_status != "FAILED"
         && inspection_status != "PENDING"
@@ -714,11 +767,15 @@ pub async fn create_pickup_inspection_handler(
         &state.db,
         order.id,
         "PRODUCT_INSPECTED",
-        Some(serde_json::json!({ "inspection_status": inspection_status, "condition": payload.condition })),
+        Some(serde_json::json!({
+            "inspection_status": inspection_status,
+            "condition": payload.condition,
+            "inspector_id": claims.sub,
+        })),
     )
     .await?;
 
-    // If inspection passed, update order status to READY_FOR_PICKUP
+    // Only an explicit PASSED inspection transitions the order to READY_FOR_PICKUP.
     if inspection_status == "PASSED" {
         sqlx::query("UPDATE orders SET status = 'READY_FOR_PICKUP', delivery_status = 'PICKUP_READY', updated_at = CURRENT_TIMESTAMP WHERE id = $1")
             .bind(order.id)
@@ -843,434 +900,4 @@ pub async fn confirm_delivery_handler(
     .bind(&tx_hash)
     .bind(order.id)
     .fetch_optional(&state.db)
-    .await;
-
-    let updated_order: Order = match update_res {
-        Ok(Some(ord)) => ord,
-        Ok(None) => {
-            let re_fetch: Order = query_as::<_, Order>(
-                "SELECT id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at FROM orders WHERE id = $1"
-            )
-            .bind(order.id)
-            .fetch_one(&state.db)
-            .await?;
-            if re_fetch.status == "COMPLETED" && re_fetch.payment_status == "RELEASED" {
-                return Ok(Json(ApiResponse {
-                    success: true,
-                    message: "Delivery already confirmed and payment released.".to_string(),
-                    data: Some(re_fetch.to_response()),
-                }));
-            } else {
-                return Err(AppError::Conflict(
-                    "Order state transition conflict or concurrent release update.".to_string(),
-                ));
-            }
-        }
-        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
-            return Err(AppError::Conflict(
-                "Release transaction hash has already been used.".to_string(),
-            ));
-        }
-        Err(e) => return Err(e.into()),
-    };
-
-    // Audit status history
-    record_order_status_history(&state.db, order.id, "COMPLETED", None).await?;
-
-    // Trigger Trust Engine evaluation for the seller exactly once per completed transaction
-    let trust_res = record_successful_transaction(&state.db, order.seller_id, order.id).await?;
-
-    // Send Notifications
-    let _ = send_notification(
-        &state.db,
-        order.seller_id,
-        "Payment Released & Order Completed",
-        &format!(
-            "Buyer confirmed delivery for order {}. Protected escrow payment has been released on-chain. Total successful transactions: {}",
-            order.id, trust_res.successful_transactions
-        ),
-        "PAYMENT_RELEASED",
-    )
-    .await;
-
-    if trust_res.level_changed {
-        let _ = send_notification(
-            &state.db,
-            order.seller_id,
-            "Seller Trust Level Promoted!",
-            &format!(
-                "Congratulations! Your Troit seller trust level has advanced to {}!",
-                trust_res.new_trust_level
-            ),
-            "TRUST_PROMOTED",
-        )
-        .await;
-    }
-
-    let _ = send_notification(
-        &state.db,
-        order.buyer_id,
-        "Order Completed",
-        "Thank you for confirming delivery! Your order is now officially complete.",
-        "ORDER_COMPLETED",
-    )
-    .await;
-
-    Ok(Json(ApiResponse {
-        success: true,
-        message: "Delivery confirmed. Order COMPLETED, protected payment RELEASED on-chain, and seller trust score updated."
-            .to_string(),
-        data: Some(updated_order.to_response()),
-    }))
-}
-
-/// POST /api/v1/orders/:id/refund
-/// Process refund for an order on Soroban Testnet
-pub async fn refund_order_handler(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Path(id): Path<Uuid>,
-    payload: Option<Json<RefundOrderRequest>>,
-) -> Result<Json<ApiResponse<OrderResponse>>, AppError> {
-    let order: Order = query_as::<_, Order>(
-        "SELECT id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at FROM orders WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Order not found".to_string()))?;
-
-    if order.buyer_id != claims.sub
-        && order.seller_id != claims.sub
-        && claims.role != UserRole::Admin
-    {
-        return Err(AppError::Forbidden(
-            "Not authorized to refund this order".to_string(),
-        ));
-    }
-
-    if order.payment_status == "REFUNDED" || order.escrow_state == "REFUNDED" {
-        return Ok(Json(ApiResponse {
-            success: true,
-            message: "Order has already been refunded.".to_string(),
-            data: Some(order.to_response()),
-        }));
-    }
-
-    let escrow_id = order
-        .escrow_id
-        .ok_or_else(|| AppError::BadRequest("Order lacks valid escrow_id mapping".to_string()))?;
-
-    let req = payload.map(|Json(p)| p);
-    let reason = req
-        .as_ref()
-        .and_then(|r| r.reason.clone())
-        .unwrap_or_else(|| "Order refund requested".to_string());
-
-    let tx_hash = if let Some(r) = req.as_ref().and_then(|r| r.tx_hash.clone()) {
-        if r.starts_with("tx-") {
-            return Err(AppError::BadRequest(
-                "Mock transaction hashes are not allowed".to_string(),
-            ));
-        }
-        state
-            .blockchain
-            .verify_transaction_semantics(&r, "refund_escrow", escrow_id as u64, None)
-            .await?;
-        r
-    } else if state.blockchain.executor().is_ok() {
-        let exec_res = state
-            .blockchain
-            .execute_refund_escrow(escrow_id as u64)
-            .await?;
-        exec_res.hash
-    } else {
-        return Err(AppError::BlockchainError(
-            "Blockchain service executor unconfigured for refund execution".to_string(),
-        ));
-    };
-
-    let updated_order: Order = query_as::<_, Order>(
-        r#"
-        UPDATE orders
-        SET status = 'CANCELLED', payment_status = 'REFUNDED', escrow_state = 'REFUNDED', refund_tx_hash = $1, blockchain_tx_hash = $1, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $2
-        RETURNING id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at
-        "#
-    )
-    .bind(&tx_hash)
-    .bind(order.id)
-    .fetch_one(&state.db)
-    .await?;
-
-    record_order_status_history(
-        &state.db,
-        order.id,
-        "ORDER_REFUNDED",
-        Some(serde_json::json!({ "reason": reason })),
-    )
-    .await?;
-
-    let _ = send_notification(
-        &state.db,
-        order.buyer_id,
-        "Order Refunded",
-        &format!("Your order {} has been refunded on-chain.", order.id),
-        "ORDER_REFUNDED",
-    )
-    .await;
-
-    Ok(Json(ApiResponse {
-        success: true,
-        message: "Order refunded successfully.".to_string(),
-        data: Some(updated_order.to_response()),
-    }))
-}
-
-/// POST /api/v1/orders/:id/dispute
-/// Raise a dispute on an order on Soroban Testnet
-pub async fn dispute_order_handler(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Path(id): Path<Uuid>,
-    payload: Option<Json<DisputeOrderRequest>>,
-) -> Result<Json<ApiResponse<OrderResponse>>, AppError> {
-    let order: Order = query_as::<_, Order>(
-        "SELECT id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at FROM orders WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Order not found".to_string()))?;
-
-    if order.buyer_id != claims.sub && order.seller_id != claims.sub {
-        return Err(AppError::Forbidden(
-            "Only buyer or seller can dispute this order".to_string(),
-        ));
-    }
-
-    if order.status == "DISPUTED" || order.escrow_state == "DISPUTED" {
-        return Ok(Json(ApiResponse {
-            success: true,
-            message: "Order is already in DISPUTED state.".to_string(),
-            data: Some(order.to_response()),
-        }));
-    }
-
-    if order.payment_status != "PROTECTED" && order.escrow_state != "FUNDED" {
-        return Err(AppError::BadRequest(
-            "Only funded/protected orders can be disputed".to_string(),
-        ));
-    }
-
-    let escrow_id = order
-        .escrow_id
-        .ok_or_else(|| AppError::BadRequest("Order lacks valid escrow_id mapping".to_string()))?;
-
-    let req = payload.map(|Json(p)| p);
-    let tx_hash = if let Some(r) = req.as_ref().and_then(|r| r.tx_hash.clone()) {
-        if r.starts_with("tx-") {
-            return Err(AppError::BadRequest(
-                "Mock transaction hashes are not allowed".to_string(),
-            ));
-        }
-        state
-            .blockchain
-            .verify_transaction_semantics(&r, "dispute_escrow", escrow_id as u64, None)
-            .await?;
-        r
-    } else if state.blockchain.executor().is_ok() {
-        let caller_secret = if order.buyer_id == claims.sub {
-            &state.config.soroban_buyer_secret_key
-        } else {
-            &state.config.soroban_seller_secret_key
-        };
-        let caller_pubkey = crate::blockchain::signer::derive_public_key_from_secret(caller_secret)
-            .map_err(|e| {
-                AppError::BlockchainError(format!("Invalid caller signer configuration: {}", e))
-            })?;
-        let exec_res = state
-            .blockchain
-            .execute_dispute_escrow(escrow_id as u64, &caller_pubkey)
-            .await?;
-        exec_res.hash
-    } else {
-        return Err(AppError::BlockchainError(
-            "Blockchain service executor unconfigured for dispute execution".to_string(),
-        ));
-    };
-
-    let updated_order: Order = query_as::<_, Order>(
-        r#"
-        UPDATE orders
-        SET status = 'DISPUTED', escrow_state = 'DISPUTED', blockchain_tx_hash = $1, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $2
-        RETURNING id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at
-        "#
-    )
-    .bind(&tx_hash)
-    .bind(order.id)
-    .fetch_one(&state.db)
-    .await?;
-
-    let reason = req
-        .map(|r| r.reason)
-        .unwrap_or_else(|| "Escrow dispute raised".to_string());
-
-    record_order_status_history(
-        &state.db,
-        order.id,
-        "ORDER_DISPUTED",
-        Some(serde_json::json!({ "reason": reason })),
-    )
-    .await?;
-
-    let _ = send_notification(
-        &state.db,
-        if order.buyer_id == claims.sub {
-            order.seller_id
-        } else {
-            order.buyer_id
-        },
-        "Order Disputed",
-        &format!("A dispute was raised for order {}: {}", order.id, reason),
-        "ORDER_DISPUTED",
-    )
-    .await;
-
-    Ok(Json(ApiResponse {
-        success: true,
-        message: "Dispute raised successfully on-chain.".to_string(),
-        data: Some(updated_order.to_response()),
-    }))
-}
-
-/// POST /api/v1/orders/:id/resolve-dispute
-/// Admin resolves order dispute on Soroban Testnet
-pub async fn resolve_dispute_handler(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<ResolveDisputeRequest>,
-) -> Result<Json<ApiResponse<OrderResponse>>, AppError> {
-    if claims.role != UserRole::Admin {
-        return Err(AppError::Forbidden(
-            "Only admins can resolve order disputes".to_string(),
-        ));
-    }
-
-    let order: Order = query_as::<_, Order>(
-        "SELECT id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at FROM orders WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Order not found".to_string()))?;
-
-    if order.status != "DISPUTED" && order.escrow_state != "DISPUTED" {
-        return Err(AppError::BadRequest(
-            "Order is not in DISPUTED state".to_string(),
-        ));
-    }
-
-    let escrow_id = order
-        .escrow_id
-        .ok_or_else(|| AppError::BadRequest("Order lacks valid escrow_id mapping".to_string()))?;
-
-    let tx_hash = if let Some(r) = payload.tx_hash.clone() {
-        if r.starts_with("tx-") {
-            return Err(AppError::BadRequest(
-                "Mock transaction hashes are not allowed".to_string(),
-            ));
-        }
-        state
-            .blockchain
-            .verify_transaction_semantics(&r, "resolve_dispute", escrow_id as u64, None)
-            .await?;
-        r
-    } else if state.blockchain.executor().is_ok() {
-        let exec_res = state
-            .blockchain
-            .execute_resolve_dispute(escrow_id as u64, payload.release_to_seller)
-            .await?;
-        exec_res.hash
-    } else {
-        return Err(AppError::BlockchainError(
-            "Blockchain service executor unconfigured for dispute resolution".to_string(),
-        ));
-    };
-
-    let updated_order: Order = if payload.release_to_seller {
-        let ord: Order = query_as::<_, Order>(
-            r#"
-            UPDATE orders
-            SET status = 'COMPLETED', payment_status = 'RELEASED', escrow_state = 'RELEASED', release_tx_hash = $1, blockchain_tx_hash = $1, updated_at = CURRENT_TIMESTAMP
-            WHERE id = $2
-            RETURNING id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at
-            "#
-        )
-        .bind(&tx_hash)
-        .bind(order.id)
-        .fetch_one(&state.db)
-        .await?;
-
-        record_order_status_history(&state.db, order.id, "DISPUTE_RESOLVED_RELEASED", None).await?;
-        let _ = record_successful_transaction(&state.db, order.seller_id, order.id).await;
-
-        let _ = send_notification(
-            &state.db,
-            order.seller_id,
-            "Dispute Resolved - Payment Released",
-            &format!(
-                "Admin resolved dispute for order {}. Funds released to seller.",
-                order.id
-            ),
-            "DISPUTE_RESOLVED",
-        )
-        .await;
-
-        ord
-    } else {
-        let ord: Order = query_as::<_, Order>(
-            r#"
-            UPDATE orders
-            SET status = 'CANCELLED', payment_status = 'REFUNDED', escrow_state = 'REFUNDED', refund_tx_hash = $1, blockchain_tx_hash = $1, updated_at = CURRENT_TIMESTAMP
-            WHERE id = $2
-            RETURNING id, buyer_id, seller_id, product_id, quantity, amount, status, payment_status, delivery_status, escrow_id, escrow_state, blockchain_tx_hash, funding_tx_hash, release_tx_hash, refund_tx_hash, created_at, updated_at
-            "#
-        )
-        .bind(&tx_hash)
-        .bind(order.id)
-        .fetch_one(&state.db)
-        .await?;
-
-        record_order_status_history(&state.db, order.id, "DISPUTE_RESOLVED_REFUNDED", None).await?;
-
-        let _ = send_notification(
-            &state.db,
-            order.buyer_id,
-            "Dispute Resolved - Payment Refunded",
-            &format!(
-                "Admin resolved dispute for order {}. Funds refunded to buyer.",
-                order.id
-            ),
-            "DISPUTE_RESOLVED",
-        )
-        .await;
-
-        ord
-    };
-
-    Ok(Json(ApiResponse {
-        success: true,
-        message: format!(
-            "Dispute resolved successfully. Escrow {}",
-            if payload.release_to_seller {
-                "RELEASED to seller"
-            } else {
-                "REFUNDED to buyer"
-            }
-        ),
-        data: Some(updated_order.to_response()),
-    }))
-}
+    .

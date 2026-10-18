@@ -8,6 +8,222 @@ use troit_logistics_backend::{
     },
 };
 
+mod order_authorization {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    use troit_logistics_backend::{
+        auth::jwt::create_token,
+        models::user::{User, UserRole},
+        routes::create_router,
+    };
+
+    fn test_user(role: UserRole) -> User {
+        User {
+            id: uuid::Uuid::new_v4(),
+            email: format!("{}@example.com", uuid::Uuid::new_v4()),
+            password_hash: "hash".to_string(),
+            full_name: "Test User".to_string(),
+            role,
+            is_verified: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn bearer(user: &User) -> String {
+        let token = create_token(user).expect("token");
+        format!("Bearer {}", token)
+    }
+
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        token: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("authorization", token)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn buyer_cannot_submit_pickup_inspection() {
+        let app = create_router().await;
+        let buyer = test_user(UserRole::Buyer);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/pickup-inspection", order_id),
+            &bearer(&buyer),
+            json!({ "status": "PASSED", "notes": "looks good" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn seller_cannot_submit_pickup_inspection() {
+        let app = create_router().await;
+        let seller = test_user(UserRole::Seller);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/pickup-inspection", order_id),
+            &bearer(&seller),
+            json!({ "status": "PASSED", "notes": "looks good" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unrelated_agent_cannot_submit_pickup_inspection() {
+        let app = create_router().await;
+        let agent = test_user(UserRole::FieldAgent);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/pickup-inspection", order_id),
+            &bearer(&agent),
+            json!({ "status": "PASSED", "notes": "looks good" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn assigned_agent_or_admin_can_submit_pickup_inspection() {
+        let app = create_router().await;
+        let admin = test_user(UserRole::Admin);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/pickup-inspection", order_id),
+            &bearer(&admin),
+            json!({ "status": "PASSED", "notes": "looks good" }),
+        )
+        .await;
+
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn pickup_inspection_requires_explicit_status() {
+        let app = create_router().await;
+        let admin = test_user(UserRole::Admin);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/pickup-inspection", order_id),
+            &bearer(&admin),
+            json!({ "notes": "no status provided" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn buyer_cannot_execute_refund() {
+        let app = create_router().await;
+        let buyer = test_user(UserRole::Buyer);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/refund", order_id),
+            &bearer(&buyer),
+            json!({ "reason": "changed mind" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn seller_cannot_execute_refund() {
+        let app = create_router().await;
+        let seller = test_user(UserRole::Seller);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/refund", order_id),
+            &bearer(&seller),
+            json!({ "reason": "changed mind" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn refund_requires_approved_decision() {
+        let app = create_router().await;
+        let admin = test_user(UserRole::Admin);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/refund", order_id),
+            &bearer(&admin),
+            json!({ "reason": "no approved dispute" }),
+        )
+        .await;
+
+        assert_ne!(status, StatusCode::OK);
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn refund_rejected_in_non_refundable_state() {
+        let app = create_router().await;
+        let admin = test_user(UserRole::Admin);
+        let order_id = uuid::Uuid::new_v4();
+
+        let (status, _) = post_json(
+            app,
+            &format!("/api/v1/orders/{}/refund", order_id),
+            &bearer(&admin),
+            json!({ "reason": "already delivered" }),
+        )
+        .await;
+
+        assert_ne!(status, StatusCode::OK);
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
 #[test]
 fn test_trust_level_deterministic_progression() {
     assert_eq!(calculate_trust_level(0, 100.0), SellerTrustLevel::LV1);

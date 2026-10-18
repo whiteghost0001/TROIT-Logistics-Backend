@@ -28,6 +28,20 @@ pub struct AppConfig {
     pub max_image_size_mb: usize,
     pub cors_allowed_origins: Vec<String>,
     pub admin_bootstrap_secret: Option<String>,
+    /// Deployment environment, e.g. "production", "staging", "development".
+    /// Defaults to "production" so that development-only features (such as the
+    /// demo seed command) are never enabled by accident.
+    pub app_env: String,
+}
+
+impl AppConfig {
+    /// Returns true only when the app is explicitly running in development.
+    pub fn is_development(&self) -> bool {
+        matches!(
+            self.app_env.trim().to_ascii_lowercase().as_str(),
+            "development" | "dev" | "local"
+        )
+    }
 }
 
 impl AppConfig {
@@ -113,6 +127,13 @@ impl AppConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        // Default to production: development-only features must be opted into.
+        let app_env = env::var("APP_ENV")
+            .or_else(|_| env::var("ENVIRONMENT"))
+            .unwrap_or_else(|_| "production".to_string())
+            .trim()
+            .to_ascii_lowercase();
+
         Ok(Self {
             database_url,
             app_host,
@@ -139,6 +160,7 @@ impl AppConfig {
             max_image_size_mb,
             cors_allowed_origins,
             admin_bootstrap_secret,
+            app_env,
         })
     }
 }
@@ -147,6 +169,48 @@ impl AppConfig {
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn test_app_env_defaults_to_production() {
+        let orig_app_env = env::var("APP_ENV").ok();
+        let orig_environment = env::var("ENVIRONMENT").ok();
+        let orig_database_url = env::var("DATABASE_URL").ok();
+        let orig_jwt_secret = env::var("JWT_SECRET").ok();
+
+        env::set_var("DATABASE_URL", "postgres://test:test@localhost:5432/test");
+        env::set_var("JWT_SECRET", "test_jwt_secret_for_unit_tests_only");
+        env::remove_var("APP_ENV");
+        env::remove_var("ENVIRONMENT");
+
+        let config = AppConfig::from_env().expect("Config loading failed");
+        assert_eq!(config.app_env, "production");
+        assert!(!config.is_development());
+
+        env::set_var("APP_ENV", "development");
+        let config = AppConfig::from_env().expect("Config loading failed");
+        assert!(config.is_development());
+
+        if let Some(val) = orig_app_env {
+            env::set_var("APP_ENV", val);
+        } else {
+            env::remove_var("APP_ENV");
+        }
+        if let Some(val) = orig_environment {
+            env::set_var("ENVIRONMENT", val);
+        } else {
+            env::remove_var("ENVIRONMENT");
+        }
+        if let Some(val) = orig_database_url {
+            env::set_var("DATABASE_URL", val);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(val) = orig_jwt_secret {
+            env::set_var("JWT_SECRET", val);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+    }
 
     #[test]
     fn test_port_resolution_priority() {

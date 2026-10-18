@@ -2,11 +2,45 @@
 mod tests {
     use troit_logistics_backend::{
         auth::service::AuthService,
+        config::AppConfig,
         models::UserRole,
         products::models::VerificationStatus,
+        routes,
         utils::{validate_email, validate_password},
     };
     use uuid::Uuid;
+
+    fn production_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.environment = "production".to_string();
+        config.enable_seed_endpoint = false;
+        config
+    }
+
+    fn development_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.environment = "development".to_string();
+        config.enable_seed_endpoint = true;
+        config
+    }
+
+    #[test]
+    fn test_seed_route_unavailable_in_production() {
+        let router = routes::build_router(production_config());
+        assert!(
+            !routes::seed_route_registered(&router),
+            "POST /api/v1/seed must not be registered in production"
+        );
+    }
+
+    #[test]
+    fn test_seed_route_available_only_in_development() {
+        let router = routes::build_router(development_config());
+        assert!(
+            routes::seed_route_registered(&router),
+            "POST /api/v1/seed should be registered when the development flag is enabled"
+        );
+    }
 
     #[test]
     fn test_verification_status_conversions() {

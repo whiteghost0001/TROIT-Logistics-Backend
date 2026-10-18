@@ -27,7 +27,6 @@ use crate::{
         restore_product_handler, update_product_handler, update_stock_handler,
         upload_product_image_handler, verify_product_handler,
     },
-    seed::handlers::seed_demo_data_handler,
     seller::handlers::{
         get_current_seller_profile_handler, get_seller_profile_by_id_handler,
         get_seller_verification_handler, submit_seller_verification_handler,
@@ -172,7 +171,7 @@ pub fn create_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Combine API v1 routes
-    let api_v1 = Router::new()
+    let mut api_v1 = Router::new()
         .nest("/auth", auth_routes)
         .nest("/products", product_routes)
         .nest("/orders", order_routes)
@@ -180,8 +179,13 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/wishlist", wishlist_routes)
         .nest("/notifications", notification_routes)
         .nest("/admin", admin_routes)
-        .route("/seed", post(seed_demo_data_handler))
         .route("/bootstrap/admin", post(admin_bootstrap_handler));
+
+    // Demo seed route is strictly development-only and never mounted in production.
+    if state.config.is_development() {
+        use crate::seed::handlers::seed_demo_data_handler;
+        api_v1 = api_v1.route("/seed", post(seed_demo_data_handler));
+    }
 
     // Root Router
     Router::new()

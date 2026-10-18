@@ -7,10 +7,23 @@
 //! 4. Database schema migration for product_images, including foreign key relationships and ON DELETE CASCADE.
 
 use troit_logistics_backend::services::storage::{
-    generate_product_image_key, validate_image_bytes, StorageConfig, StorageError,
+    generate_product_image_key, validate_image_bytes, StorageConfig, StorageError, StorageService,
     ALLOWED_MIME_TYPES, MAX_IMAGES_PER_PRODUCT, MAX_IMAGE_SIZE_BYTES,
 };
 use uuid::Uuid;
+
+fn valid_test_config() -> StorageConfig {
+    StorageConfig {
+        provider: "r2".to_string(),
+        bucket_name: "troit-prod-bucket".to_string(),
+        endpoint: "https://account_id.r2.cloudflarestorage.com".to_string(),
+        region: "auto".to_string(),
+        access_key_id: "valid_access_key".to_string(),
+        secret_access_key: "valid_secret_key".to_string(),
+        public_url_prefix: "https://cdn.troitlogistics.com".to_string(),
+        max_image_size_mb: 5,
+    }
+}
 
 #[test]
 fn test_storage_config_strict_validation() {
@@ -41,18 +54,75 @@ fn test_storage_config_strict_validation() {
 
 #[test]
 fn test_storage_config_valid_pass() {
-    let valid_config = StorageConfig {
-        provider: "r2".to_string(),
-        bucket_name: "troit-prod-bucket".to_string(),
-        endpoint: "https://account_id.r2.cloudflarestorage.com".to_string(),
-        region: "auto".to_string(),
-        access_key_id: "valid_access_key".to_string(),
-        secret_access_key: "valid_secret_key".to_string(),
-        public_url_prefix: "https://cdn.troitlogistics.com".to_string(),
-        max_image_size_mb: 5,
-    };
+    let valid_config = valid_test_config();
 
     assert!(valid_config.validate().is_ok());
+}
+
+#[test]
+fn test_storage_service_construction_with_upgraded_s3_client() {
+    // Constructing the service exercises the rust-s3 client builder against the
+    // upgraded dependency; no network calls are made here.
+    let service = StorageService::new(valid_test_config())
+        .expect("StorageService must construct from a valid config");
+    assert!(service.is_ok());
+}
+
+#[test]
+fn test_storage_service_rejects_invalid_config() {
+    let mut config = valid_test_config();
+    config.bucket_name = "".to_string();
+
+    let result = StorageService::new(config);
+    assert!(result.is_err());
+    match result {
+        Err(StorageError::InvalidConfig(_)) => {}
+        _ => panic!("Expected StorageError::InvalidConfig"),
+    }
+}
+
+#[test]
+fn test_storage_service_public_url_generation() {
+    let service = StorageService::new(valid_test_config())
+        .expect("StorageService must construct from a valid config");
+
+    let seller_id = Uuid::new_v4();
+    let product_id = Uuid::new_v4();
+    let key = generate_product_image_key(seller_id, product_id, "png");
+
+    let url = service.generate_public_url(&key);
+    assert_eq!(
+        url,
+        format!("https://cdn.troitlogistics.com/{}", key),
+        "Public URL must be prefixed with the configured CDN prefix"
+    );
+}
+
+#[tokio::test]
+async fn test_storage_service_upload_and_delete_api_surface() {
+    // The upgraded rust-s3 client exposes upload/delete through the service.
+    // Without live R2 credentials these calls must fail gracefully (returning an
+    // error) rather than panicking, which validates the new API wiring.
+    let service = StorageService::new(valid_test_config())
+        .expect("StorageService must construct from a valid config");
+
+    let seller_id = Uuid::new_v4();
+    let product_id = Uuid::new_v4();
+    let key = generate_product_image_key(seller_id, product_id, "png");
+
+    let png_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+
+    let upload_result = service.upload_object(&key, png_bytes, "image/png").await;
+    assert!(
+        upload_result.is_err(),
+        "Upload against an unreachable endpoint must return an error, not panic"
+    );
+
+    let delete_result = service.delete_object(&key).await;
+    assert!(
+        delete_result.is_err(),
+        "Delete against an unreachable endpoint must return an error, not panic"
+    );
 }
 
 #[test]

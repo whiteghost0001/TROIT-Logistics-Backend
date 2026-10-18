@@ -132,7 +132,7 @@ impl StorageConfig {
 /// Core production Cloudflare R2 / S3 Storage Service implementation
 #[allow(dead_code)]
 pub struct StorageService {
-    bucket: Bucket,
+    bucket: Box<Bucket>,
     public_url_prefix: String,
     config: StorageConfig,
 }
@@ -157,6 +157,8 @@ impl StorageService {
             endpoint: config.endpoint.clone(),
         };
 
+        // rust-s3 0.34+ returns a `Box<Bucket>` from `Bucket::new`, and
+        // `with_path_style` consumes and returns the bucket by value.
         let bucket = Bucket::new(&config.bucket_name, region, credentials)
             .map_err(|e| {
                 StorageError::InitializationFailed(format!("Failed to create bucket handle: {}", e))
@@ -205,10 +207,11 @@ impl StorageClient for StorageService {
                     ))
                 })?;
 
-            if response.status_code() < 200 || response.status_code() >= 300 {
+            let status = response.status_code();
+            if !(200..300).contains(&status) {
                 return Err(StorageError::UploadFailed(format!(
                     "R2 upload returned HTTP error status code: {}",
-                    response.status_code()
+                    status
                 )));
             }
 
@@ -228,12 +231,12 @@ impl StorageClient for StorageService {
                 ))
             })?;
 
-            if response.status_code() < 200
-                || response.status_code() >= 300 && response.status_code() != 404
-            {
+            let status = response.status_code();
+            // Treat 2xx and 404 (already absent) as success.
+            if !(200..300).contains(&status) && status != 404 {
                 return Err(StorageError::DeleteFailed(format!(
                     "R2 delete returned HTTP status code: {}",
-                    response.status_code()
+                    status
                 )));
             }
 

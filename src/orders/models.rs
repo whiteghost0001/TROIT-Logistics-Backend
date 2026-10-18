@@ -84,7 +84,35 @@ pub struct UpdateOrderStatusRequest {
 pub struct CreatePickupInspectionRequest {
     pub condition: String,
     pub notes: Option<String>,
-    pub inspection_status: Option<String>,
+    /// Required: the inspector must explicitly state the inspection outcome.
+    /// There is intentionally no default so `PASSED` can never be implied.
+    pub inspection_status: String,
+}
+
+/// Audit record for a refund, capturing who requested, approved and executed it.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct RefundAudit {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub requested_by: Uuid,
+    pub approved_by: Option<Uuid>,
+    pub executed_by: Option<Uuid>,
+    pub status: String,
+    pub reason: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub executed_at: Option<DateTime<Utc>>,
+    pub tx_hash: Option<String>,
+}
+
+/// Approval record for a refund / dispute decision.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct RefundApproval {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub approved_by: Uuid,
+    pub approved_at: DateTime<Utc>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
